@@ -1,7 +1,7 @@
+import ParticleSystem from './ParticleSystem'
+
 const App = () => {
-  return (
-    <div className=''>App</div>
-  )
+  return <ParticleSystem />
 }
 
 export default App
