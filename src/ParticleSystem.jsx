@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { Hands } from '@mediapipe/hands';
-import { Camera } from '@mediapipe/camera_utils';
 
 const ParticleSystem = () => {
   const containerRef = useRef(null);
@@ -128,6 +127,18 @@ const ParticleSystem = () => {
     // Store original positions for expansion effect
     const positions = geometry.attributes.position.array;
     particles.userData.originalPositions = new Float32Array(positions);
+    
+    // Pre-calculate distances for performance optimization
+    const distanceCache = new Float32Array(positions.length / 3);
+    for (let i = 0; i < positions.length; i += 3) {
+      const dist = Math.sqrt(
+        positions[i] ** 2 + 
+        positions[i + 1] ** 2 + 
+        positions[i + 2] ** 2
+      );
+      distanceCache[i / 3] = dist > 0 ? 1 : 0;
+    }
+    particles.userData.distanceCache = distanceCache;
 
     // Animation loop
     const animate = () => {
@@ -139,22 +150,20 @@ const ParticleSystem = () => {
         particlesRef.current.scale.set(scale, scale, scale);
         particlesRef.current.rotation.y += 0.002;
         
-        // Particle expansion effect
+        // Particle expansion effect (optimized with cached distances)
         if (particlesRef.current.geometry.attributes.position) {
           const positions = particlesRef.current.geometry.attributes.position.array;
           const originalPositions = particlesRef.current.userData.originalPositions;
+          const distanceCache = particlesRef.current.userData.distanceCache;
           
-          if (originalPositions) {
+          if (originalPositions && distanceCache) {
+            const expansionFactor = 1 + expansion * 0.5;
             for (let i = 0; i < positions.length; i += 3) {
-              const dist = Math.sqrt(
-                originalPositions[i] ** 2 + 
-                originalPositions[i + 1] ** 2 + 
-                originalPositions[i + 2] ** 2
-              );
-              const direction = dist > 0 ? 1 : 0;
-              positions[i] = originalPositions[i] * (1 + expansion * direction * 0.5);
-              positions[i + 1] = originalPositions[i + 1] * (1 + expansion * direction * 0.5);
-              positions[i + 2] = originalPositions[i + 2] * (1 + expansion * direction * 0.5);
+              const direction = distanceCache[i / 3];
+              const factor = 1 + (expansionFactor - 1) * direction;
+              positions[i] = originalPositions[i] * factor;
+              positions[i + 1] = originalPositions[i + 1] * factor;
+              positions[i + 2] = originalPositions[i + 2] * factor;
             }
             particlesRef.current.geometry.attributes.position.needsUpdate = true;
           }
@@ -176,6 +185,17 @@ const ParticleSystem = () => {
 
     return () => {
       window.removeEventListener('resize', handleResize);
+      
+      // Properly dispose Three.js resources to prevent memory leaks
+      if (particlesRef.current) {
+        if (particlesRef.current.geometry) {
+          particlesRef.current.geometry.dispose();
+        }
+        if (particlesRef.current.material) {
+          particlesRef.current.material.dispose();
+        }
+      }
+      
       renderer.dispose();
       if (container && container.contains(renderer.domElement)) {
         container.removeChild(renderer.domElement);
@@ -246,23 +266,66 @@ const ParticleSystem = () => {
       }
     });
 
-    const camera = new Camera(videoRef.current, {
-      onFrame: async () => {
-        await hands.send({ image: videoRef.current });
-      },
-      width: 640,
-      height: 480
-    });
+    // Use refs to store cleanup resources
+    const cleanupRefs = {
+      animationFrameId: null,
+      streamRef: null,
+      demoInterval: null
+    };
     
-    camera.start().then(() => {
-      setIsLoading(false);
-    }).catch((error) => {
-      console.error('Camera error:', error);
-      setIsLoading(false);
-    });
+    // Try to start camera
+    const startCamera = async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'user', width: 640, height: 480 }
+        });
+        
+        cleanupRefs.streamRef = stream;
+        videoRef.current.srcObject = stream;
+        
+        await videoRef.current.play();
+        setIsLoading(false);
+        
+        // Start sending frames to MediaPipe
+        const sendFrame = async () => {
+          if (videoRef.current && videoRef.current.readyState === 4) {
+            await hands.send({ image: videoRef.current });
+          }
+          cleanupRefs.animationFrameId = requestAnimationFrame(sendFrame);
+        };
+        sendFrame();
+        
+      } catch (error) {
+        console.error('Camera access denied or not available:', error);
+        setIsLoading(false);
+        
+        // Start demo mode with simulated hand gestures
+        let time = 0;
+        cleanupRefs.demoInterval = setInterval(() => {
+          time += 0.05;
+          // Simulate hand opening and closing
+          const simulatedScale = 1 + Math.sin(time) * 0.5;
+          const simulatedExpansion = Math.cos(time * 0.5) * 0.3;
+          handDataRef.current = {
+            scale: simulatedScale,
+            expansion: simulatedExpansion
+          };
+        }, 50);
+      }
+    };
+    
+    startCamera();
 
     return () => {
-      camera.stop();
+      if (cleanupRefs.animationFrameId) {
+        cancelAnimationFrame(cleanupRefs.animationFrameId);
+      }
+      if (cleanupRefs.streamRef) {
+        cleanupRefs.streamRef.getTracks().forEach(track => track.stop());
+      }
+      if (cleanupRefs.demoInterval) {
+        clearInterval(cleanupRefs.demoInterval);
+      }
       hands.close();
     };
   }, []);
@@ -414,10 +477,19 @@ const ParticleSystem = () => {
             lineHeight: '1.5',
             margin: 0
           }}>
-            👋 Show your hands to the camera!<br/>
-            ✋ Open hands = scale up<br/>
-            ✊ Close hands = scale down<br/>
-            🤏 Hand tension = particle expansion
+            {isLoading ? (
+              '⏳ Initializing...'
+            ) : (
+              <>
+                👋 Show your hands to the camera!<br/>
+                ✋ Open hands = scale up<br/>
+                ✊ Close hands = scale down<br/>
+                🤏 Hand tension = particle expansion<br/>
+                <span style={{ fontSize: '10px', opacity: 0.6 }}>
+                  (Demo mode if camera unavailable)
+                </span>
+              </>
+            )}
           </p>
         </div>
       </div>
